@@ -1,6 +1,6 @@
 {
   "name": "arduino-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local stdio MCP server that compiles Arduino sketches via arduino-cli and returns structured compiler diagnostics",
   "main": "server.js",
   "type": "commonjs",
@@ -10,6 +10,9 @@
     "inspect": "npx @modelcontextprotocol/inspector node server.js"
   },
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.4.3"

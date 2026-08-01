@@ -22,6 +22,16 @@ const COMPILE_TIMEOUT_MS = 180_000;
 const INSTALL_TIMEOUT_MS = 600_000;
 const STDERR_EXCERPT_CHARS = 2000;
 
+// Repo drift detection (GitHub)
+const REPO_STATE_FILE = path.join(DATA_DIR, "repo-state.json");
+const GITHUB_API = "https://api.github.com";
+const DRIFT_DEFAULT_REPO = "basicmicro_arduino";
+const DRIFT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const DRIFT_TIMEOUT_MS = 10_000; // explicit tool calls: 10s, one retry
+const DRIFT_INLINE_TIMEOUT_MS = 5_000; // inline compile path: 5s, no retry
+const DRIFT_MAX_COMMITS = 20;
+const DRIFT_MAX_FILES = 300;
+
 // Alias -> FQBN. Anything containing ":" is treated as a raw FQBN and passed through.
 const BOARD_ALIASES = {
   uno: "arduino:avr:uno",
@@ -260,10 +270,236 @@ async function listInstalledLibraries() {
 }
 
 // ---------------------------------------------------------------------------
+// Repo drift detection (GitHub)
+// ---------------------------------------------------------------------------
+// Baseline-per-repo stored in data\repo-state.json. The baseline ONLY advances
+// on an explicit acknowledge:true call (or on first sight of a repo, which
+// bootstraps it) — an unacknowledged drift keeps reporting on every check.
+// All network failures degrade to { checked: false, reason } — never a throw.
+
+// Bare names resolve to the basicmicro org; "owner/name" passes through.
+function resolveRepo(repo) {
+  const trimmed = String(repo || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!/^[\w.-]+(\/[\w.-]+)?$/.test(trimmed)) {
+    throw new Error(
+      `Invalid repo "${repo}". Use a bare name (basicmicro_arduino, basicmicro_python, basicmicro_ros2) or owner/name.`
+    );
+  }
+  const [a, b] = trimmed.split("/");
+  return b ? { owner: a, name: b } : { owner: "basicmicro", name: a };
+}
+
+function loadRepoState() {
+  try {
+    return parseJson(fs.readFileSync(REPO_STATE_FILE, "utf8"));
+  } catch {
+    return {}; // absent or corrupt -> start fresh
+  }
+}
+
+function saveRepoState(state) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(REPO_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+}
+
+// The one fetch helper for all GitHub calls. 4xx (except 429) is not retried.
+async function fetchJson(url, { timeout = DRIFT_TIMEOUT_MS, retry = 1, as = "json" } = {}) {
+  if (typeof fetch !== "function") {
+    throw new Error("global fetch unavailable — Node.js >= 18 required");
+  }
+  const headers = {
+    "User-Agent": "arduino-mcp",
+    Accept: as === "json" ? "application/vnd.github+json" : "text/plain",
+  };
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  let lastErr;
+  for (let attempt = 0; attempt <= retry; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+      const res = await fetch(url, { headers, signal: ctrl.signal, redirect: "follow" });
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status} from ${url}`);
+        err.status = res.status;
+        throw err;
+      }
+      return as === "json" ? await res.json() : await res.text();
+    } catch (err) {
+      lastErr = err.name === "AbortError" ? new Error(`timeout after ${timeout}ms fetching ${url}`) : err;
+      if (err.status && err.status < 500 && err.status !== 429) break;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr;
+}
+
+// Resolve default branch (the org mixes main and master) and fetch its head commit.
+async function getRepoHead(owner, name, opts) {
+  for (const branch of ["main", "master"]) {
+    try {
+      const commits = await fetchJson(
+        `${GITHUB_API}/repos/${owner}/${name}/commits?sha=${encodeURIComponent(branch)}&per_page=1`,
+        opts
+      );
+      if (Array.isArray(commits) && commits[0]) {
+        const c = commits[0];
+        return {
+          branch,
+          sha: c.sha,
+          date: c.commit?.committer?.date || c.commit?.author?.date || null,
+          message: (c.commit?.message || "").split("\n")[0],
+        };
+      }
+    } catch (err) {
+      // 404/409/422 on main -> the repo likely uses master; anything else is fatal.
+      if (branch === "main" && [404, 409, 422].includes(err.status)) continue;
+      throw err;
+    }
+  }
+  throw new Error(`could not resolve default branch of ${owner}/${name} (tried main, master)`);
+}
+
+async function checkRepoDrift(repoInput, { acknowledge = false, force = false, timeout = DRIFT_TIMEOUT_MS, retry = 1 } = {}) {
+  let owner, name;
+  try {
+    ({ owner, name } = resolveRepo(repoInput));
+  } catch (err) {
+    return { repo: String(repoInput), checked: false, reason: err.message };
+  }
+  const key = `${owner}/${name}`;
+  const state = loadRepoState();
+  const entry = state[key];
+
+  // Serve the cached report while fresh; acknowledge and force always go live.
+  const ageMs = entry && entry.last_checked ? Date.now() - Date.parse(entry.last_checked) : NaN;
+  if (!force && !acknowledge && entry && entry.last_report && ageMs >= 0 && ageMs < DRIFT_CACHE_TTL_MS) {
+    const ageH = Math.round((ageMs / 3_600_000) * 10) / 10;
+    const cacheNote = `served from cache (${ageH}h old); pass force:true for a live check`;
+    return {
+      ...entry.last_report,
+      note: [entry.last_report.note, cacheNote].filter(Boolean).join("; "),
+    };
+  }
+
+  const opts = { timeout, retry };
+  let head;
+  try {
+    head = await getRepoHead(owner, name, opts);
+  } catch (err) {
+    return { repo: key, checked: false, reason: err.message };
+  }
+
+  const report = {
+    repo: key,
+    branch: head.branch,
+    checked: true,
+    drift: false,
+    head: { sha: head.sha, date: head.date, message: head.message },
+    baseline: null,
+    acknowledged: false,
+  };
+
+  if (!entry || !entry.baseline_sha) {
+    report.baseline = { sha: head.sha, date: head.date };
+    report.note = "baseline recorded";
+  } else {
+    report.baseline = { sha: entry.baseline_sha, date: entry.baseline_date || null };
+    if (entry.baseline_sha !== head.sha) {
+      report.drift = true;
+      let cmp;
+      try {
+        cmp = await fetchJson(`${GITHUB_API}/repos/${key}/compare/${entry.baseline_sha}...${head.sha}`, opts);
+      } catch (err) {
+        return { repo: key, checked: false, reason: `compare failed: ${err.message}` };
+      }
+      report.ahead_by = cmp.ahead_by ?? null;
+      const commits = Array.isArray(cmp.commits) ? cmp.commits : [];
+      report.new_commits = commits.slice(-DRIFT_MAX_COMMITS).map((c) => ({
+        sha: (c.sha || "").slice(0, 7),
+        date: c.commit?.committer?.date || c.commit?.author?.date || null,
+        message: (c.commit?.message || "").split("\n")[0],
+      }));
+      const files = Array.isArray(cmp.files) ? cmp.files.slice(0, DRIFT_MAX_FILES) : [];
+      report.touched_paths = [...new Set(files.map((f) => (f.filename || "").split("/")[0]).filter(Boolean))];
+    }
+  }
+
+  // Arduino library repo only: compare the repo's declared library.properties
+  // version against the installed Basicmicro library. Best-effort — a failure
+  // here just omits the version fields.
+  if (name === "basicmicro_arduino") {
+    try {
+      const props = await fetchJson(`https://raw.githubusercontent.com/${key}/${head.sha}/library.properties`, {
+        ...opts,
+        as: "text",
+      });
+      const m = /^version=(.+)$/m.exec(props);
+      if (m) report.repo_declared_version = m[1].trim();
+      const installed = (await listInstalledLibraries()).find((l) => l.name.toLowerCase() === "basicmicro");
+      if (installed) report.installed_version = installed.version;
+      if (report.repo_declared_version && report.installed_version) {
+        report.release_pending = report.repo_declared_version !== report.installed_version;
+      }
+    } catch {
+      /* advisory only */
+    }
+  }
+
+  const now = new Date().toISOString();
+  const next = entry ? { ...entry } : { acknowledged_at: null };
+  if (!entry || !entry.baseline_sha) {
+    next.baseline_sha = head.sha;
+    next.baseline_date = head.date;
+  }
+  if (acknowledge) {
+    next.baseline_sha = head.sha;
+    next.baseline_date = head.date;
+    next.acknowledged_at = now;
+    report.acknowledged = true;
+    if (report.drift) report.note = "drift acknowledged; baseline advanced to head";
+  }
+  next.last_checked = now;
+  // The cached report must reflect the post-acknowledge state, or the inline
+  // compile path would keep attaching an already-acknowledged drift for 24h.
+  next.last_report =
+    acknowledge && report.drift
+      ? {
+          ...report,
+          drift: false,
+          baseline: { sha: head.sha, date: head.date },
+          ahead_by: undefined,
+          new_commits: undefined,
+          touched_paths: undefined,
+          note: `drift acknowledged at ${now}`,
+        }
+      : { ...report };
+  state[key] = next;
+  try {
+    saveRepoState(state);
+  } catch (err) {
+    report.note = [report.note, `warning: could not persist ${REPO_STATE_FILE}: ${err.message}`]
+      .filter(Boolean)
+      .join("; ");
+  }
+  return report;
+}
+
+// Inline path for arduino_compile: cached within 24h, 5s live budget, no retry,
+// never acknowledges. Never throws.
+async function getCompileRepoDrift() {
+  try {
+    return await checkRepoDrift(DRIFT_DEFAULT_REPO, { timeout: DRIFT_INLINE_TIMEOUT_MS, retry: 0 });
+  } catch (err) {
+    return { repo: `basicmicro/${DRIFT_DEFAULT_REPO}`, checked: false, reason: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP server + tools
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({ name: "arduino-mcp", version: "1.0.0" });
+const server = new McpServer({ name: "arduino-mcp", version: "1.1.0" });
 
 const diagnosticSchema = z.object({
   severity: z.string(),
@@ -291,6 +527,29 @@ const compileResultSchema = z.object({
   duration_ms: z.number(),
   raw_stderr_excerpt: z.string().optional(),
 });
+
+// Shared by arduino_check_repo_drift's outputSchema and arduino_compile's
+// repo_drift field. Everything past `repo` is optional: a network failure
+// yields only { repo, checked: false, reason }.
+const driftReportShape = {
+  repo: z.string(),
+  checked: z.boolean().optional(),
+  reason: z.string().optional(),
+  branch: z.string().optional(),
+  drift: z.boolean().optional(),
+  head: z.object({ sha: z.string(), date: z.string().nullable(), message: z.string() }).optional(),
+  baseline: z.object({ sha: z.string(), date: z.string().nullable() }).nullable().optional(),
+  ahead_by: z.number().nullable().optional(),
+  new_commits: z
+    .array(z.object({ sha: z.string(), date: z.string().nullable(), message: z.string() }))
+    .optional(),
+  touched_paths: z.array(z.string()).optional(),
+  installed_version: z.string().optional(),
+  repo_declared_version: z.string().optional(),
+  release_pending: z.boolean().optional(),
+  acknowledged: z.boolean().optional(),
+  note: z.string().optional(),
+};
 
 function textResult(structured, isError = false) {
   const out = { content: [{ type: "text", text: JSON.stringify(structured, null, 2) }] };
@@ -327,7 +586,10 @@ server.registerTool(
         .optional()
         .describe("Library names that must already be installed; compile fails fast if any is missing"),
     },
-    outputSchema: { results: z.array(compileResultSchema) },
+    outputSchema: {
+      results: z.array(compileResultSchema),
+      repo_drift: z.object(driftReportShape).optional(),
+    },
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
   async ({ code, boards, filename, libraries }) => {
@@ -351,6 +613,11 @@ server.registerTool(
       }
     }
 
+    // Basicmicro sketches get a repo drift report attached. Runs concurrently
+    // with the compiles (5s budget, 24h cache), never blocks or fails them.
+    const driftPromise =
+      libraries && libraries.some((l) => l.toLowerCase() === "basicmicro") ? getCompileRepoDrift() : null;
+
     const results = [];
     for (const { board, fqbn } of targets) {
       const result = await enqueueCompile(async () => {
@@ -363,8 +630,42 @@ server.registerTool(
       });
       results.push(result);
     }
-    return textResult({ results });
+    const out = { results };
+    if (driftPromise) out.repo_drift = await driftPromise;
+    return textResult(out);
   }
+);
+
+server.registerTool(
+  "arduino_check_repo_drift",
+  {
+    title: "Check BasicMicro repo drift",
+    description:
+      "Check whether a BasicMicro GitHub repo has new commits since the last acknowledged baseline. " +
+      "Reports head vs baseline, new commits (up to 20), touched top-level paths, and — for the Arduino " +
+      "library repo — the repo's declared library.properties version vs the installed Basicmicro version. " +
+      "Read-only by default; acknowledge:true MUTATES the stored baseline (advances it to the current head) " +
+      "and is the ONLY way the baseline moves — unacknowledged drift keeps reporting on every check. " +
+      "Results are served from a 24h cache; force:true always does a live GitHub check. " +
+      "Network failures return { checked: false, reason } rather than an error.",
+    inputSchema: {
+      repo: z
+        .string()
+        .default(DRIFT_DEFAULT_REPO)
+        .describe(
+          "Bare repo name resolved to the basicmicro org (basicmicro_arduino, basicmicro_python, " +
+            "basicmicro_ros2) or any owner/name"
+        ),
+      acknowledge: z
+        .boolean()
+        .default(false)
+        .describe("After reporting, record the current head as the new baseline (mutates data\\repo-state.json)"),
+      force: z.boolean().default(false).describe("Bypass the 24h cache and always query GitHub live"),
+    },
+    outputSchema: driftReportShape,
+    annotations: { openWorldHint: true },
+  },
+  async ({ repo, acknowledge, force }) => textResult(await checkRepoDrift(repo, { acknowledge, force }))
 );
 
 server.registerTool(
@@ -529,9 +830,14 @@ module.exports = {
   BOARD_ALIASES,
   BUILD_CACHE_DIR,
   COMPILE_TIMEOUT_MS,
+  REPO_STATE_FILE,
   resolveBoard,
   resolveCli,
   runCli,
   writeSketch,
   parseCompileResult,
+  resolveRepo,
+  fetchJson,
+  checkRepoDrift,
+  getCompileRepoDrift,
 };

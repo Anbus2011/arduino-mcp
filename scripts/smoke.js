@@ -3,9 +3,18 @@
 //   node scripts\smoke.js
 // Compiles a known-good Basicmicro sketch for leonardo (expect ok=true) and the
 // same sketch with the include removed (expect ok=false with a line-numbered
-// error diagnostic). Exits non-zero on any mismatch.
+// error diagnostic), then runs the repo drift check (expect a valid report, or
+// a clean { checked:false } skip when offline). Exits non-zero on any mismatch.
 
-const { resolveBoard, runCli, writeSketch, parseCompileResult, BUILD_CACHE_DIR, COMPILE_TIMEOUT_MS } = require("../server.js");
+const {
+  resolveBoard,
+  runCli,
+  writeSketch,
+  parseCompileResult,
+  checkRepoDrift,
+  BUILD_CACHE_DIR,
+  COMPILE_TIMEOUT_MS,
+} = require("../server.js");
 
 const GOOD_SKETCH = `#include <Basicmicro.h>
 
@@ -44,13 +53,13 @@ function check(label, cond, detail) {
 (async () => {
   console.log("arduino-mcp smoke test (board: leonardo)\n");
 
-  console.log("[1/2] known-good Basicmicro sketch:");
+  console.log("[1/3] known-good Basicmicro sketch:");
   const good = await compile(GOOD_SKETCH);
   check("compiles clean (ok=true)", good.ok === true, JSON.stringify(good.diagnostics) + (good.raw_stderr_excerpt || ""));
   check("reports flash usage", good.memory && typeof good.memory.flash_bytes === "number", JSON.stringify(good.memory));
   check("reports RAM usage", good.memory && typeof good.memory.ram_bytes === "number", JSON.stringify(good.memory));
 
-  console.log("\n[2/2] same sketch without the include:");
+  console.log("\n[2/3] same sketch without the include:");
   const bad = await compile(BAD_SKETCH);
   const lineNumberedErrors = bad.diagnostics.filter((d) => d.severity === "error" && Number.isFinite(d.line));
   check("fails to compile (ok=false)", bad.ok === false);
@@ -59,6 +68,24 @@ function check(label, cond, detail) {
     lineNumberedErrors.length >= 1,
     JSON.stringify(bad.diagnostics)
   );
+
+  console.log("\n[3/3] repo drift check (basicmicro_arduino):");
+  const drift = await checkRepoDrift("basicmicro_arduino", { force: true });
+  const liveOk =
+    drift &&
+    drift.checked === true &&
+    typeof drift.drift === "boolean" &&
+    drift.head &&
+    typeof drift.head.sha === "string" &&
+    drift.baseline &&
+    typeof drift.baseline.sha === "string";
+  const offlineOk = drift && drift.checked === false && typeof drift.reason === "string" && drift.reason.length > 0;
+  check("drift report or clean offline skip", liveOk || offlineOk, JSON.stringify(drift));
+  if (liveOk) {
+    console.log(`        drift=${drift.drift}${drift.note ? ` (${drift.note})` : ""} head=${drift.head.sha.slice(0, 7)}`);
+  } else if (offlineOk) {
+    console.log(`        offline skip: ${drift.reason}`);
+  }
 
   console.log(failures === 0 ? "\nSMOKE PASS" : `\nSMOKE FAIL (${failures} check(s) failed)`);
   process.exit(failures === 0 ? 0 : 1);
